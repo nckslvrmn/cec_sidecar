@@ -1,0 +1,256 @@
+#!/usr/bin/python3 -I
+"""Fill in the CEC replies cecd doesn't send (in time) on this machine.
+
+LG TVs only forward remote-control keys to the device that is the active
+source and that answers power-status polls promptly. On this box cecd fails to
+correlate the USB Pulse-Eight with a DRM connector's EDID, stays silent, and
+stalls for seconds while the TV is powering on, so the TV decides the PC is off.
+
+This opens /dev/cec0 as an extra (non-exclusive) follower, alongside cecd, and:
+  - answers <Give Device Power Status> with "On";
+  - answers <Request Active Source> if this PC was the last thing on screen;
+  - announces <Active Source> when the TV routes to our input.
+The last active path is persisted so it survives restarts.
+"""
+import errno
+import fcntl
+import os
+import select
+import struct
+import sys
+import time
+
+CEC_DEV = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("CEC_DEVICE", "/dev/cec0")
+CEC_ADAP_G_PHYS_ADDR = 0x80026101
+CEC_ADAP_G_LOG_ADDRS = 0x805C6103   # struct cec_log_addrs: 92 bytes
+CEC_TRANSMIT = 0xC0386105           # struct cec_msg: 56 bytes
+CEC_RECEIVE = 0xC0386106
+CEC_DQEVENT = 0xC0506107            # struct cec_event: 80 bytes
+CEC_S_MODE = 0x40046109
+CEC_MODE_INITIATOR, CEC_MODE_FOLLOWER = 0x01, 0x10
+CEC_RX_STATUS_OK = 0x01
+TV, BROADCAST = 0, 15
+
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+                     "cec-sidecar", "last_path")
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def load_path():
+    try:
+        return int(open(STATE).read().strip(), 16)
+    except (OSError, ValueError):
+        return None
+
+
+active_path = load_path()  # physical address currently (or last) on screen
+
+
+def save_path(pa):
+    global active_path
+    if pa == active_path:
+        return
+    active_path = pa
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        with open(STATE, "w") as f:
+            f.write(f"{pa:04x}\n")
+    except OSError:
+        pass
+
+
+fd = os.open(CEC_DEV, os.O_RDWR | os.O_NONBLOCK)
+fcntl.ioctl(fd, CEC_S_MODE, struct.pack("I", CEC_MODE_INITIATOR | CEC_MODE_FOLLOWER))
+
+
+def our_addr():
+    return struct.unpack("H", fcntl.ioctl(fd, CEC_ADAP_G_PHYS_ADDR, b"\0\0"))[0]
+
+
+def our_la():
+    return fcntl.ioctl(fd, CEC_ADAP_G_LOG_ADDRS, bytes(92))[0]
+
+
+def send(payload, dest):
+    la = our_la()
+    if la > 15:  # not configured yet
+        return
+    data = bytes([(la << 4) | dest]) + bytes(payload)
+    msg = bytearray(56)
+    struct.pack_into("I", msg, 16, len(data))
+    msg[32:32 + len(data)] = data
+    try:
+        fcntl.ioctl(fd, CEC_TRANSMIT, msg, True)  # non-blocking fd: queued, returns at once
+        pending[struct.unpack_from("I", msg, 24)[0]] = (time.monotonic(), data)
+    except OSError as e:
+        log(f"send {data.hex()} failed: {e}")
+
+
+VERBOSE = os.environ.get("CEC_VERBOSE") == "1"
+pending = {}  # sequence -> (queued at, data)
+TX_STATUS = {0x01: "OK", 0x02: "ARB_LOST", 0x04: "NACK", 0x08: "LOW_DRIVE",
+             0x10: "ERROR", 0x20: "MAX_RETRIES", 0x40: "ABORTED", 0x80: "TIMEOUT"}
+
+
+def tx_result(msg):
+    seq = struct.unpack_from("I", msg, 24)[0]
+    queued, data = pending.pop(seq, (None, b""))
+    st = msg[50]
+    ok = st & 0x01
+    if VERBOSE or not ok:
+        flags = "|".join(v for k, v in TX_STATUS.items() if st & k) or hex(st)
+        lat = f"{(time.monotonic() - queued) * 1000:.0f}ms" if queued else "?"
+        log(f"tx {data.hex()} {flags} after {lat} (nack={msg[52]} arb={msg[51]})")
+
+
+last_claim = 0.0
+
+
+def claim(reason):
+    global last_claim
+    now = time.monotonic()
+    if now - last_claim < 2:  # the TV often sends several routing messages at once
+        return
+    pa = our_addr()
+    if pa == 0xFFFF:
+        return
+    last_claim = now
+    send([0x82, pa >> 8, pa & 0xFF], BROADCAST)  # <Active Source>
+    send([0x8E, 0x00], TV)                        # <Menu Status: activated>
+    save_path(pa)
+    log(f"claimed active source ({reason})")
+
+
+# Recovery: with a slow adapter (Pulse-Eight) the power-on race can be lost
+# because the TX queue backs up for seconds while cecd reconfigures. The TV then
+# declares itself active source (82 00 00) and shows its home screen. If that
+# happens shortly after the TV powered on and this PC was the expected input,
+# wait for the bus to calm down and do a one-touch-play to take the input back.
+RECOVERY_WINDOW = 30.0   # seconds after TV power-on in which a takeover is "not the user"
+RECOVERY_DELAY = 2.0     # let cecd / the bus settle first
+MAX_RECOVERIES = 3
+tv_on_at = None
+expect_pc = False
+recoveries = 0
+recover_at = None
+
+
+def tv_powered_on(pa):
+    global tv_on_at, expect_pc, recoveries, recover_at
+    now = time.monotonic()
+    if tv_on_at is not None and now - tv_on_at < 60:
+        return
+    tv_on_at, recoveries, recover_at = now, 0, None
+    expect_pc = active_path == pa
+    log(f"TV powered on; PC expected: {expect_pc}")
+
+
+def tv_took_input():
+    global recover_at
+    if not expect_pc or tv_on_at is None or recover_at is not None:
+        return
+    if time.monotonic() - tv_on_at > RECOVERY_WINDOW or recoveries >= MAX_RECOVERIES:
+        return
+    recover_at = time.monotonic() + RECOVERY_DELAY
+    log("TV took the input back during power-on; will reclaim")
+
+
+def other_device_chosen():
+    global expect_pc, recover_at
+    expect_pc, recover_at = False, None
+
+
+def recover():
+    global recoveries, recover_at, last_claim
+    recover_at = None
+    recoveries += 1
+    send([0x04], TV)  # <Image View On>
+    last_claim = 0.0
+    claim(f"recovery #{recoveries}")
+
+
+def handle(initiator, dest, op, args):
+    global tv_on_at, recover_at
+    pa = our_addr()
+    if op == 0x82 and len(args) >= 2:                    # <Active Source> from anyone
+        src = args[0] << 8 | args[1]
+        save_path(src)
+        if initiator == TV and src == 0:
+            tv_took_input()
+        elif src != pa:
+            other_device_chosen()
+        return
+    if initiator != TV:
+        return
+    if op == 0x36:                                       # <Standby>
+        tv_on_at, recover_at = None, None
+        return
+    if op == 0x90 and dest == BROADCAST and args[:1] == b"\x00":  # <Report Power Status: On>
+        tv_powered_on(pa)
+    elif op == 0x84 and args[:2] == b"\x00\x00":         # TV <Report Physical Address> at boot
+        tv_powered_on(pa)
+    if op == 0x80 and len(args) >= 4:
+        new = args[2] << 8 | args[3]
+        if new not in (0, pa):
+            other_device_chosen()
+    if op == 0x8F and dest != BROADCAST:                 # <Give Device Power Status>
+        send([0x90, 0x00], TV)                           # <Report Power Status: On>
+        log("answered power status poll")
+    elif op == 0x86 and len(args) >= 2:                  # <Set Stream Path>
+        save_path(args[0] << 8 | args[1])
+        if active_path == pa:
+            claim("set stream path")
+    elif op == 0x80 and len(args) >= 4:                  # <Routing Change> old -> new
+        save_path(args[2] << 8 | args[3])
+        if active_path == pa:
+            claim("routing change")
+    elif op == 0x85:                                     # <Request Active Source>
+        if active_path == pa:
+            claim("request active source")
+    elif op == 0x8D and active_path == pa:               # <Menu Request>
+        send([0x8E, 0x00], TV)
+
+
+log(f"listening on {CEC_DEV}; last active path: "
+    + (f"{active_path:04x}" if active_path is not None else "unknown"))
+poller = select.poll()
+poller.register(fd, select.POLLIN | select.POLLPRI)
+while True:
+    timeout = None
+    if recover_at is not None:
+        timeout = max(0, int((recover_at - time.monotonic()) * 1000))
+    events = poller.poll(timeout)
+    if recover_at is not None and time.monotonic() >= recover_at:
+        recover()
+    for _, ev in events:
+        if ev & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+            log("CEC device went away; exiting for restart")
+            sys.exit(1)
+        if ev & select.POLLPRI:  # state-change events: just drain them
+            try:
+                fcntl.ioctl(fd, CEC_DQEVENT, bytearray(80), True)
+            except OSError:
+                pass
+        while True:
+            msg = bytearray(56)
+            try:
+                fcntl.ioctl(fd, CEC_RECEIVE, msg, True)
+            except OSError as e:
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    break
+                raise
+            if not msg[49] & CEC_RX_STATUS_OK:  # our own transmit results
+                if msg[50]:
+                    tx_result(msg)
+                continue
+            n = struct.unpack_from("I", msg, 16)[0]
+            data = bytes(msg[32:32 + n])
+            if VERBOSE and data and data[0] >> 4 == TV and n >= 2 and data[1] != 0x87:
+                rx_ts = struct.unpack_from("Q", msg, 8)[0] / 1e9
+                lag = time.clock_gettime(time.CLOCK_MONOTONIC) - rx_ts
+                log(f"rx {data.hex()} (lag {lag * 1000:.0f}ms)")
+            if n >= 2:
+                handle(data[0] >> 4, data[0] & 0xF, data[1], data[2:])

@@ -1,0 +1,12 @@
+[Unit]
+Description=CEC sidecar for cecd (answers TV power polls, keeps this PC the active source)
+After=cecd.service
+BindsTo=cecd.service
+
+[Service]
+ExecStart=%h/.local/bin/cec-sidecar
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=cecd.service
